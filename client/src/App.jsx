@@ -11,7 +11,10 @@ const MEDIA_CONSTRAINTS = {
 const DEFAULT_VIDEO_BITRATE = 900000
 
 function createRoomCode() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase()
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const values = new Uint32Array(8)
+  crypto.getRandomValues(values)
+  return Array.from(values, (value) => alphabet[value % alphabet.length]).join('')
 }
 
 function getMediaErrorMessage(error) {
@@ -83,6 +86,7 @@ function App() {
   const [unreadCount, setUnreadCount] = useState(0)
   const [notification, setNotification] = useState('')
   const [copyFeedback, setCopyFeedback] = useState('')
+  const [isJoining, setIsJoining] = useState(false)
   const localVideoRef = useRef(null)
   const remoteVideoRef = useRef(null)
   const socketRef = useRef(null)
@@ -103,6 +107,7 @@ function App() {
 
     socket.on('connect', () => setCallState((state) => state === 'idle' ? 'ready' : state))
     socket.on('room-joined', async ({ roomId: joinedId, isCaller }) => {
+      setIsJoining(false)
       activeRoomRef.current = joinedId
       setJoinedRoom(joinedId)
       setCallState('waiting')
@@ -113,13 +118,17 @@ function App() {
       await peer.setLocalDescription(offer)
       socket.emit('signal', { roomId: joinedId, data: { type: 'offer', offer } })
     })
-    socket.on('peer-joined', () => setCallState('connecting'))
+    socket.on('peer-joined', () => {
+      if (!peerRef.current || peerRef.current.connectionState === 'closed') createPeer(activeRoomRef.current)
+      setCallState('connecting')
+    })
     socket.on('peer-media-state', ({ cameraOff, audioOff }) => {
       setIsRemoteCameraOff(cameraOff)
       setIsRemoteMuted(audioOff)
     })
     socket.on('chat-message', ({ id, text }) => {
-      setMessages((currentMessages) => [...currentMessages, { id, text, isOwn: false }])
+      if (typeof id !== 'string' || typeof text !== 'string') return
+      setMessages((currentMessages) => [...currentMessages.slice(-99), { id: `${id}-${Date.now()}`, text, isOwn: false }])
       if (!isChatOpenRef.current) {
         setUnreadCount((count) => count + 1)
         setNotification('New message received')
@@ -128,23 +137,40 @@ function App() {
     })
     socket.on('signal', async ({ data }) => {
       const peer = peerRef.current
-      if (!peer) return
+      if (!peer || !data || typeof data.type !== 'string') return
 
-      if (data.type === 'offer') {
-        await peer.setRemoteDescription(data.offer)
-        await flushPendingCandidates(peer)
-        const answer = await peer.createAnswer()
-        await peer.setLocalDescription(answer)
-        socket.emit('signal', { roomId: activeRoomRef.current, data: { type: 'answer', answer } })
-      } else if (data.type === 'answer') {
-        await peer.setRemoteDescription(data.answer)
-        await flushPendingCandidates(peer)
-      } else if (data.type === 'ice-candidate' && data.candidate) {
-        if (peer.remoteDescription) await peer.addIceCandidate(data.candidate)
-        else pendingCandidatesRef.current.push(data.candidate)
+      try {
+        if (data.type === 'offer' && data.offer) {
+          await peer.setRemoteDescription(data.offer)
+          await flushPendingCandidates(peer)
+          const answer = await peer.createAnswer()
+          await peer.setLocalDescription(answer)
+          socket.emit('signal', { roomId: activeRoomRef.current, data: { type: 'answer', answer } })
+        } else if (data.type === 'answer' && data.answer) {
+          await peer.setRemoteDescription(data.answer)
+          await flushPendingCandidates(peer)
+        } else if (data.type === 'ice-candidate' && data.candidate) {
+          if (peer.remoteDescription) await peer.addIceCandidate(data.candidate)
+          else pendingCandidatesRef.current.push(data.candidate)
+        }
+      } catch {
+        setNotification('The call connection needs to be retried')
+        window.setTimeout(() => setNotification(''), 3000)
       }
     })
+    socket.on('room-error', (message) => {
+      setIsJoining(false)
+      stopCall()
+      activeRoomRef.current = ''
+      setError(typeof message === 'string' ? message : 'That room code is not valid.')
+      setCallState('ready')
+    })
+    socket.on('chat-rate-limited', () => {
+      setNotification('You are sending messages too quickly')
+      window.setTimeout(() => setNotification(''), 2200)
+    })
     socket.on('room-full', () => {
+      setIsJoining(false)
       stopCall()
       activeRoomRef.current = ''
       setJoinedRoom('')
@@ -158,6 +184,9 @@ function App() {
       setCallState('ready')
     })
     socket.on('peer-left', () => {
+      peerRef.current?.close()
+      peerRef.current = null
+      pendingCandidatesRef.current = []
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
       setIsRemoteCameraOff(false)
       setIsRemoteMuted(false)
@@ -234,6 +263,7 @@ function App() {
   }, [callState])
 
   function createPeer(activeRoomId) {
+    pendingCandidatesRef.current = []
     const peer = new RTCPeerConnection({ iceServers: ICE_SERVERS })
     peerRef.current = peer
     localStreamRef.current?.getTracks().forEach((track) => {
@@ -268,10 +298,13 @@ function App() {
 
   async function joinRoom(event) {
     event.preventDefault()
+    if (isJoining) return
     const activeRoomId = roomId.trim().toUpperCase()
     if (!activeRoomId) return setError('Enter a room code first.')
+    if (!/^[A-Z0-9]{6,12}$/.test(activeRoomId)) return setError('Use 6-12 letters or numbers for the room code.')
 
     try {
+      setIsJoining(true)
       setError('')
       activeRoomRef.current = activeRoomId
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
@@ -282,7 +315,12 @@ function App() {
       createPeer(activeRoomId)
       socketRef.current.emit('join-room', activeRoomId)
     } catch (error) {
+      localStreamRef.current?.getTracks().forEach((track) => track.stop())
+      localStreamRef.current = null
+      peerRef.current?.close()
+      peerRef.current = null
       activeRoomRef.current = ''
+      setIsJoining(false)
       setError(error.message === 'UNSUPPORTED_MEDIA_CONTEXT' ? 'Camera and microphone need a secure browser page. Use localhost or HTTPS.' : getMediaErrorMessage(error))
     }
   }
@@ -294,6 +332,7 @@ function App() {
     localStreamRef.current = null
     peerRef.current?.close()
     peerRef.current = null
+    pendingCandidatesRef.current = []
     setIsScreenSharing(false)
   }
 
@@ -317,7 +356,7 @@ function App() {
     const text = chatInput.trim()
     if (!text || !activeRoomRef.current) return
 
-    setMessages((currentMessages) => [...currentMessages, { id: `local-${Date.now()}`, text, isOwn: true }])
+    setMessages((currentMessages) => [...currentMessages.slice(-99), { id: `local-${Date.now()}`, text, isOwn: true }])
     socketRef.current.emit('chat-message', { roomId: activeRoomRef.current, text })
     setChatInput('')
   }

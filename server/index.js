@@ -6,6 +6,9 @@ import { Server } from 'socket.io'
 const app = express()
 const httpServer = createServer(app)
 const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173'
+const roomIdPattern = /^[A-Z0-9]{6,12}$/
+const chatWindowMs = 10000
+const maxChatMessagesPerWindow = 10
 const io = new Server(httpServer, {
   cors: {
     origin: clientOrigin,
@@ -21,6 +24,15 @@ io.on('connection', (socket) => {
   console.log(`Client connected: ${socket.id}`)
 
   socket.on('join-room', (roomId) => {
+    if (typeof roomId !== 'string' || !roomIdPattern.test(roomId)) {
+      socket.emit('room-error', 'Use a 6-12 character room code containing only letters and numbers.')
+      return
+    }
+    if (socket.data.roomId) {
+      socket.emit('room-error', 'Leave your current room before joining another one.')
+      return
+    }
+
     const room = io.sockets.adapter.rooms.get(roomId)
     const memberCount = room?.size ?? 0
 
@@ -47,19 +59,38 @@ io.on('connection', (socket) => {
     }
   })
 
-  socket.on('media-state', ({ roomId, cameraOff, audioOff }) => {
+  socket.on('media-state', (payload) => {
+    if (!payload || typeof payload !== 'object') return
+    const { roomId, cameraOff, audioOff } = payload
     if (socket.data.roomId !== roomId || typeof cameraOff !== 'boolean' || typeof audioOff !== 'boolean') return
     socket.data.cameraOff = cameraOff
     socket.data.audioOff = audioOff
     socket.to(roomId).emit('peer-media-state', { cameraOff, audioOff })
   })
 
-  socket.on('signal', ({ roomId, data }) => {
+  socket.on('signal', (payload) => {
+    if (!payload || typeof payload !== 'object') return
+    const { roomId, data } = payload
+    if (socket.data.roomId !== roomId || !data || typeof data !== 'object') return
+    if (!['offer', 'answer', 'ice-candidate'].includes(data.type)) return
     socket.to(roomId).emit('signal', { data })
   })
 
-  socket.on('chat-message', ({ roomId, text }) => {
+  socket.on('chat-message', (payload) => {
+    if (!payload || typeof payload !== 'object') return
+    const { roomId, text } = payload
+    if (socket.data.roomId !== roomId) return
     if (typeof text !== 'string' || !text.trim()) return
+    const now = Date.now()
+    if (!socket.data.chatWindowStart || now - socket.data.chatWindowStart >= chatWindowMs) {
+      socket.data.chatWindowStart = now
+      socket.data.chatMessageCount = 0
+    }
+    if (socket.data.chatMessageCount >= maxChatMessagesPerWindow) {
+      socket.emit('chat-rate-limited')
+      return
+    }
+    socket.data.chatMessageCount += 1
     socket.to(roomId).emit('chat-message', {
       id: socket.id,
       text: text.trim().slice(0, 1000),
@@ -71,6 +102,8 @@ io.on('connection', (socket) => {
     const roomId = socket.data.roomId
     socket.leave(roomId)
     socket.data.roomId = null
+    socket.data.chatWindowStart = null
+    socket.data.chatMessageCount = 0
     socket.to(roomId).emit('peer-left')
   })
 

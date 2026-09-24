@@ -15,8 +15,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm ci
-      - run: npm test
+      - run: npm ci --prefix client
+      - run: npm ci --prefix server
+      - run: npm run build --prefix client
 
   publish-gpr:
     needs: build
