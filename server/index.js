@@ -31,12 +31,27 @@ io.on('connection', (socket) => {
 
     socket.join(roomId)
     socket.data.roomId = roomId
+    socket.data.cameraOff = false
+    socket.data.audioOff = false
     console.log(`Client ${socket.id} joined room ${roomId}`)
     socket.emit('room-joined', { roomId, isCaller: memberCount === 0 })
 
     if (memberCount === 1) {
+      for (const peerSocketId of io.sockets.adapter.rooms.get(roomId) ?? []) {
+        const peerSocket = io.sockets.sockets.get(peerSocketId)
+        if (peerSocket && peerSocket.id !== socket.id) {
+          socket.emit('peer-media-state', { cameraOff: Boolean(peerSocket.data.cameraOff), audioOff: Boolean(peerSocket.data.audioOff) })
+        }
+      }
       socket.to(roomId).emit('peer-joined')
     }
+  })
+
+  socket.on('media-state', ({ roomId, cameraOff, audioOff }) => {
+    if (socket.data.roomId !== roomId || typeof cameraOff !== 'boolean' || typeof audioOff !== 'boolean') return
+    socket.data.cameraOff = cameraOff
+    socket.data.audioOff = audioOff
+    socket.to(roomId).emit('peer-media-state', { cameraOff, audioOff })
   })
 
   socket.on('signal', ({ roomId, data }) => {
