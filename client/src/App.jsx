@@ -2,7 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001'
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  ...(import.meta.env.VITE_TURN_URL ? [{
+    urls: import.meta.env.VITE_TURN_URL,
+    username: import.meta.env.VITE_TURN_USERNAME,
+    credential: import.meta.env.VITE_TURN_CREDENTIAL,
+  }] : []),
+]
 const LOGO_SRC = '/logo.png?v=3'
 const MEDIA_CONSTRAINTS = {
   video: { width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 }, frameRate: { ideal: 24, max: 30 } },
@@ -87,6 +94,8 @@ function App() {
   const [notification, setNotification] = useState('')
   const [copyFeedback, setCopyFeedback] = useState('')
   const [isJoining, setIsJoining] = useState(false)
+  const [isInstallable, setIsInstallable] = useState(false)
+  const installPromptRef = useRef(null)
   const localVideoRef = useRef(null)
   const remoteVideoRef = useRef(null)
   const socketRef = useRef(null)
@@ -102,10 +111,49 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const socket = io(SERVER_URL)
+    const handleInstallPrompt = (event) => {
+      event.preventDefault()
+      installPromptRef.current = event
+      setIsInstallable(true)
+    }
+
+    const handleAppInstalled = () => {
+      installPromptRef.current = null
+      setIsInstallable(false)
+    }
+
+    window.addEventListener('beforeinstallprompt', handleInstallPrompt)
+    window.addEventListener('appinstalled', handleAppInstalled)
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallPrompt)
+      window.removeEventListener('appinstalled', handleAppInstalled)
+    }
+  }, [])
+
+  useEffect(() => {
+    const socket = io(SERVER_URL, {
+      transports: ['polling', 'websocket'],
+      upgrade: true,
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      timeout: 15000,
+      withCredentials: false,
+    })
     socketRef.current = socket
 
-    socket.on('connect', () => setCallState((state) => state === 'idle' ? 'ready' : state))
+    socket.on('connect', () => {
+      console.log('Socket.IO connected:', socket.id)
+      setCallState((state) => state === 'idle' ? 'ready' : state)
+      setError('')
+    })
+
+    socket.on('connect_error', (error) => {
+      console.error('Socket.IO connection error:', error)
+      setIsJoining(false)
+      setCallState('offline')
+      setError(`Server connection failed: ${error?.message || 'Unable to connect to the calling server.'}`)
+    })
     socket.on('room-joined', async ({ roomId: joinedId, isCaller }) => {
       setIsJoining(false)
       activeRoomRef.current = joinedId
@@ -313,15 +361,80 @@ function App() {
       const stream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS)
       localStreamRef.current = stream
       createPeer(activeRoomId)
-      socketRef.current.emit('join-room', activeRoomId)
+
+      const socket = socketRef.current
+      if (!socket) {
+        throw new Error('SOCKET_UNAVAILABLE')
+      }
+
+      if (socket.connected) {
+        console.log('Joining room:', activeRoomId)
+        socket.emit('join-room', activeRoomId)
+      } else {
+        setError('Connecting to the calling server...')
+        await new Promise((resolve, reject) => {
+          let settled = false
+
+          const cleanup = () => {
+            window.clearTimeout(timeoutId)
+            socket.off('connect', handleConnect)
+            socket.off('connect_error', handleConnectError)
+          }
+
+          const finish = (callback) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            callback()
+          }
+
+          const handleConnect = () => {
+            finish(() => {
+              console.log('Socket connected; joining room:', activeRoomId)
+              socket.emit('join-room', activeRoomId)
+              resolve()
+            })
+          }
+
+          const handleConnectError = (error) => {
+            finish(() => reject(error))
+          }
+
+          const timeoutId = window.setTimeout(() => {
+            finish(() => reject(new Error('SOCKET_TIMEOUT')))
+          }, 15000)
+
+          socket.once('connect', handleConnect)
+          socket.once('connect_error', handleConnectError)
+        })
+      }
     } catch (error) {
+      console.error('Join call failed:', error)
+
       localStreamRef.current?.getTracks().forEach((track) => track.stop())
       localStreamRef.current = null
       peerRef.current?.close()
       peerRef.current = null
       activeRoomRef.current = ''
       setIsJoining(false)
-      setError(error.message === 'UNSUPPORTED_MEDIA_CONTEXT' ? 'Camera and microphone need a secure browser page. Use localhost or HTTPS.' : getMediaErrorMessage(error))
+
+      if (error?.message === 'UNSUPPORTED_MEDIA_CONTEXT') {
+        setError('Camera and microphone need a secure browser page. Use localhost or HTTPS.')
+      } else if (
+        error?.message === 'SOCKET_TIMEOUT' ||
+        error?.message === 'SOCKET_UNAVAILABLE' ||
+        error?.message?.toLowerCase().includes('socket') ||
+        error?.message?.toLowerCase().includes('transport')
+      ) {
+        setCallState('offline')
+        setError('Server connection failed. Please refresh the page and try again.')
+      } else if (error?.name === 'NotAllowedError' || error?.name === 'PermissionDeniedError') {
+        setError('Camera or microphone permission was blocked. Allow both in your browser settings, then try again.')
+      } else if (error?.name === 'NotFoundError') {
+        setError('No camera or microphone was found on this device.')
+      } else {
+        setError(`Could not start the call: ${error?.message || error?.name || 'Unknown error'}`)
+      }
     }
   }
 
@@ -420,6 +533,16 @@ function App() {
     }
   }
 
+  async function installApp() {
+    const prompt = installPromptRef.current
+    if (!prompt) return
+
+    prompt.prompt()
+    await prompt.userChoice
+    installPromptRef.current = null
+    setIsInstallable(false)
+  }
+
   function toggleTrack(kind) {
     const track = localStreamRef.current?.getTracks().find((item) => item.kind === kind)
     if (!track) return
@@ -477,7 +600,7 @@ function App() {
             <button type="submit">Join call <span>↗</span></button>
           </div>
         </form>
-        <div className="secondary-actions"><button className="new-room" onClick={() => setRoomId(createRoomCode())}><span className="spark">✦</span> Create a new room <span>↗</span></button><span className="shortcut-hint">No sign-up needed</span></div>
+        <div className="secondary-actions"><button className="new-room" onClick={() => setRoomId(createRoomCode())}><span className="spark">✦</span> Create a new room <span>↗</span></button>{isInstallable ? <button className="install-app" onClick={installApp}>Install app</button> : <span className="shortcut-hint">No sign-up needed</span>}</div>
         {error && <p className="error-message" role="alert">{error}</p>}
         <div className="feature-strip" aria-label="Room features"><span><i>✦</i> Private by design</span><span><i>◌</i> No recordings</span><span><i>·</i> Just two people</span></div>
         <p className="creator-credit">Created by <strong>Mr Frost</strong><span className="credit-dot" /> Built for the moments between words</p>

@@ -2,6 +2,6 @@ import { defineConfig } from 'vite'
 
 export default defineConfig({
   server: {
-    allowedHosts: ['villages-appreciate-tip-jon.trycloudflare.com'],
+    allowedHosts: ['landscape-technologies-putting-coal.trycloudflare.com'],
   },
 })

@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: kuch-batein-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: CLIENT_ORIGIN
+        value: https://kuch-batein-client.onrender.com
+
+  - type: static
+    name: kuch-batein-client
+    rootDir: client
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_SERVER_URL
+        value: https://kuch-batein-server.onrender.com

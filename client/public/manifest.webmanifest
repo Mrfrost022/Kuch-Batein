@@ -1,0 +1,19 @@
+{
+  "name": "Kuch Batein",
+  "short_name": "Kuch Batein",
+  "description": "Private one-to-one video calls with no sign-up.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a1b22",
+  "theme_color": "#0a1b22",
+  "icons": [
+    {
+      "src": "/logo.png",
+      "sizes": "1254x1254",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
